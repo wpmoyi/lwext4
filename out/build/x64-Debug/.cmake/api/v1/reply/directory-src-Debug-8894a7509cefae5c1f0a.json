@@ -1,0 +1,61 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"INSTALL"
+		],
+		"files" : 
+		[
+			"src/CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 20,
+				"parent" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 21,
+				"parent" : 0
+			}
+		]
+	},
+	"installers" : 
+	[
+		{
+			"backtrace" : 1,
+			"component" : "Unspecified",
+			"destination" : "D:/Program Files (x86)/WiseUCEnt/DATA/\u9b4f\u5e05\u5e05@115871/Downloads/\u5218\u6625\u8499/\u5b58\u50a8\u82af\u7247+\u6587\u4ef6\u7cfb\u7edf/\u5b58\u50a8\u82af\u7247+\u6587\u4ef6\u7cfb\u7edf/lwext4\u8f93\u5165\u5185\u7f51/lwext4\u8f93\u5165\u5185\u7f51/lwext4-master/lwext4-master/out/install/x64-Debug/lib",
+			"paths" : 
+			[
+				"src/lwext4.lib"
+			],
+			"targetId" : "lwext4::@145eef247bfb46b6828c",
+			"targetIndex" : 2,
+			"type" : "target"
+		},
+		{
+			"backtrace" : 2,
+			"component" : "Unspecified",
+			"destination" : "D:/Program Files (x86)/WiseUCEnt/DATA/\u9b4f\u5e05\u5e05@115871/Downloads/\u5218\u6625\u8499/\u5b58\u50a8\u82af\u7247+\u6587\u4ef6\u7cfb\u7edf/\u5b58\u50a8\u82af\u7247+\u6587\u4ef6\u7cfb\u7edf/lwext4\u8f93\u5165\u5185\u7f51/lwext4\u8f93\u5165\u5185\u7f51/lwext4-master/lwext4-master/out/install/x64-Debug/include/lwext4",
+			"paths" : 
+			[
+				"out/build/x64-Debug/include/."
+			],
+			"type" : "directory"
+		}
+	],
+	"paths" : 
+	{
+		"build" : "src",
+		"source" : "src"
+	}
+}
