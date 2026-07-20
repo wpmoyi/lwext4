@@ -45,9 +45,17 @@
 #define DLOG(...)
 #endif
 
-#ifndef EXT4_RW_BUFFER_SIZE
-#define EXT4_RW_BUFFER_SIZE  4096
+#ifndef DFS_EXT_CACHE_BUF_SIZE
+#define DFS_EXT_CACHE_BUF_SIZE  524288
 #endif
+
+struct dfs_ext4_cache
+{
+    uint64_t bufFirstBytePos;
+    uint32_t bufLen;
+    uint8_t  buf[DFS_EXT_CACHE_BUF_SIZE];
+    uint8_t  bufDirty;
+};
 
 struct dfs_ext4_vnode
 {
@@ -65,11 +73,7 @@ struct dfs_ext4_file
     } entry;
     struct dfs_ext4_vnode vnode;
 
-    /* read/write buffer */
-    uint8_t *rw_buffer;       /* dynamically allocated; NULL = fallback to direct I/O */
-    off_t    rw_buf_pos;      /* file offset where buffer starts */
-    size_t   rw_buf_len;      /* valid bytes in buffer */
-    int      rw_buf_dirty;    /* 1 = unflushed writes in buffer */
+    struct dfs_ext4_cache *cache;  /* dynamically allocated; NULL = fallback to direct I/O */
 };
 
 static rt_mutex_t ext4_mutex = RT_NULL;
@@ -459,25 +463,31 @@ static int dfs_ext_statfs(struct dfs_mnt *mnt, struct statfs *buf)
 
 /* file ops */
 
-static int flush_dirty_buffer(struct dfs_ext4_file *ext_file)
+static int flush_dirty_cache(struct dfs_ext4_file *ext_file)
 {
     size_t written = 0;
     int r;
 
-    if (!ext_file->rw_buf_dirty || ext_file->rw_buf_len == 0)
+    if (!ext_file->cache->bufDirty || ext_file->cache->bufLen == 0)
         return 0;
 
-    ext4_fseek(&ext_file->entry.file, ext_file->rw_buf_pos, SEEK_SET);
-    r = ext4_fwrite(&ext_file->entry.file, ext_file->rw_buffer,
-                    ext_file->rw_buf_len, &written);
+    ext4_fseek(&ext_file->entry.file, ext_file->cache->bufFirstBytePos, SEEK_SET);
+    r = ext4_fwrite(&ext_file->entry.file, ext_file->cache->buf,
+                    ext_file->cache->bufLen, &written);
     if (r == 0)
     {
-        ext_file->rw_buf_dirty = 0;
-        ext_file->rw_buf_len = 0;
+        ext_file->cache->bufDirty = 0;
+        ext_file->cache->bufLen = 0;
         return 0;
     }
     /* keep dirty flag for retry on next operation */
     return -EIO;
+}
+
+static int flush_dirty_buf(struct dfs_file *file)
+{
+    struct dfs_ext4_file *ext_file = (struct dfs_ext4_file *)file->data;
+    return flush_dirty_cache(ext_file);
 }
 
 static ssize_t dfs_ext_read(struct dfs_file *file, void *buf, size_t count, off_t *pos)
@@ -496,7 +506,7 @@ static ssize_t dfs_ext_read(struct dfs_file *file, void *buf, size_t count, off_
     rt_mutex_take(&file->vnode->lock, RT_WAITING_FOREVER);
 
     /* Fallback: no buffer allocated, use direct I/O */
-    if (!ext_file->rw_buffer)
+    if (!ext_file->cache)
     {
         ext4_fseek(&ext_file->entry.file, *pos, SEEK_SET);
         r = ext4_fread(&ext_file->entry.file, buf, count, &bytesread);
@@ -512,19 +522,19 @@ static ssize_t dfs_ext_read(struct dfs_file *file, void *buf, size_t count, off_
     /* Buffered read with read-ahead */
     while (count > 0 && *pos < file->vnode->size)
     {
-        /* Buffer hit: position falls within [rw_buf_pos, rw_buf_pos + rw_buf_len) */
-        if (*pos >= ext_file->rw_buf_pos &&
-            *pos < ext_file->rw_buf_pos + ext_file->rw_buf_len)
+        /* Buffer hit: position falls within [bufFirstBytePos, bufFirstBytePos + bufLen) */
+        if (*pos >= ext_file->cache->bufFirstBytePos &&
+            *pos < ext_file->cache->bufFirstBytePos + ext_file->cache->bufLen)
         {
-            size_t buf_off = (size_t)(*pos - ext_file->rw_buf_pos);
-            size_t chunk = ext_file->rw_buf_len - buf_off;
+            size_t buf_off = (size_t)(*pos - ext_file->cache->bufFirstBytePos);
+            size_t chunk = ext_file->cache->bufLen - buf_off;
             if (chunk > count)
                 chunk = count;
             if (*pos + (off_t)chunk > file->vnode->size)
                 chunk = (size_t)(file->vnode->size - *pos);
 
             memcpy((uint8_t *)buf + bytesread,
-                   ext_file->rw_buffer + buf_off, chunk);
+                   ext_file->cache->buf + buf_off, chunk);
             *pos += (off_t)chunk;
             bytesread += chunk;
             count -= chunk;
@@ -532,17 +542,17 @@ static ssize_t dfs_ext_read(struct dfs_file *file, void *buf, size_t count, off_
         else
         {
             /* Buffer miss - flush dirty data first if needed */
-            if (ext_file->rw_buf_dirty)
+            if (ext_file->cache->bufDirty)
             {
-                if (flush_dirty_buffer(ext_file) != 0)
+                if (flush_dirty_buf(file) != 0)
                     break;  /* flush failed, keep dirty data for retry */
             }
 
-            if (count >= EXT4_RW_BUFFER_SIZE)
+            if (count >= DFS_EXT_CACHE_BUF_SIZE)
             {
                 /* Large read: bypass buffer, read whole multiples
                  * directly into user buffer to avoid extra memcpy */
-                size_t bulk = (count / EXT4_RW_BUFFER_SIZE) * EXT4_RW_BUFFER_SIZE;
+                size_t bulk = (count / DFS_EXT_CACHE_BUF_SIZE) * DFS_EXT_CACHE_BUF_SIZE;
                 size_t rd = 0;
                 ext4_fseek(&ext_file->entry.file, *pos, SEEK_SET);
                 r = ext4_fread(&ext_file->entry.file,
@@ -561,14 +571,14 @@ static ssize_t dfs_ext_read(struct dfs_file *file, void *buf, size_t count, off_
                  * next iteration will hit the buffer and memcpy */
                 size_t rd = 0;
                 ext4_fseek(&ext_file->entry.file, *pos, SEEK_SET);
-                r = ext4_fread(&ext_file->entry.file, ext_file->rw_buffer,
-                               EXT4_RW_BUFFER_SIZE, &rd);
+                r = ext4_fread(&ext_file->entry.file, ext_file->cache->buf,
+                               DFS_EXT_CACHE_BUF_SIZE, &rd);
                 if (r != 0 || rd == 0)
                     break;
 
-                ext_file->rw_buf_pos = *pos;
-                ext_file->rw_buf_len = rd;
-                ext_file->rw_buf_dirty = 0;
+                ext_file->cache->bufFirstBytePos = *pos;
+                ext_file->cache->bufLen = rd;
+                ext_file->cache->bufDirty = 0;
             }
         }
     }
@@ -594,7 +604,7 @@ static ssize_t dfs_ext_write(struct dfs_file *file, const void *buf, size_t coun
     rt_mutex_take(&file->vnode->lock, RT_WAITING_FOREVER);
 
     /* Fallback: no buffer allocated, use direct I/O */
-    if (!ext_file->rw_buffer)
+    if (!ext_file->cache)
     {
         ext4_fseek(&ext_file->entry.file, *pos, SEEK_SET);
         r = ext4_fwrite(&ext_file->entry.file, buf, count, &byteswritten);
@@ -612,24 +622,24 @@ static ssize_t dfs_ext_write(struct dfs_file *file, const void *buf, size_t coun
     while (count > 0)
     {
         /* Write position falls within the valid buffer range
-         * [rw_buf_pos, rw_buf_pos + rw_buf_len] AND
+         * [bufFirstBytePos, bufFirstBytePos + bufLen] AND
          * still inside the buffer capacity window?
          * (pos > buf_end would create a gap — flush first) */
-        if (*pos >= ext_file->rw_buf_pos &&
-            *pos <= ext_file->rw_buf_pos + (off_t)ext_file->rw_buf_len &&
-            *pos < ext_file->rw_buf_pos + EXT4_RW_BUFFER_SIZE)
+        if (*pos >= ext_file->cache->bufFirstBytePos &&
+            *pos <= ext_file->cache->bufFirstBytePos + (off_t)ext_file->cache->bufLen &&
+            *pos < ext_file->cache->bufFirstBytePos + DFS_EXT_CACHE_BUF_SIZE)
         {
-            size_t buf_off = (size_t)(*pos - ext_file->rw_buf_pos);
-            size_t space  = EXT4_RW_BUFFER_SIZE - buf_off;
+            size_t buf_off = (size_t)(*pos - ext_file->cache->bufFirstBytePos);
+            size_t space  = DFS_EXT_CACHE_BUF_SIZE - buf_off;
             size_t chunk  = (count < space) ? count : space;
-            size_t old_len = ext_file->rw_buf_len;
+            size_t old_len = ext_file->cache->bufLen;
 
-            memcpy(ext_file->rw_buffer + buf_off, src, chunk);
-            ext_file->rw_buf_dirty = 1;
+            memcpy(ext_file->cache->buf + buf_off, src, chunk);
+            ext_file->cache->bufDirty = 1;
 
             /* Extend buffer if we wrote past the old end */
-            if (buf_off + chunk > ext_file->rw_buf_len)
-                ext_file->rw_buf_len = buf_off + chunk;
+            if (buf_off + chunk > ext_file->cache->bufLen)
+                ext_file->cache->bufLen = buf_off + chunk;
 
             src += chunk;
             *pos += (off_t)chunk;
@@ -638,10 +648,10 @@ static ssize_t dfs_ext_write(struct dfs_file *file, const void *buf, size_t coun
 
             /* Flush only if the buffer *just* became full,
              * not on every overwrite of an already-full buffer */
-            if (ext_file->rw_buf_len >= EXT4_RW_BUFFER_SIZE &&
-                old_len < EXT4_RW_BUFFER_SIZE)
+            if (ext_file->cache->bufLen >= DFS_EXT_CACHE_BUF_SIZE &&
+                old_len < DFS_EXT_CACHE_BUF_SIZE)
             {
-                if (flush_dirty_buffer(ext_file) != 0)
+                if (flush_dirty_buf(file) != 0)
                     goto write_out;
             }
         }
@@ -649,13 +659,13 @@ static ssize_t dfs_ext_write(struct dfs_file *file, const void *buf, size_t coun
         {
             /* Not contiguous and not inside buffer -
              * flush old dirty data first */
-            if (ext_file->rw_buf_dirty)
+            if (ext_file->cache->bufDirty)
             {
-                if (flush_dirty_buffer(ext_file) != 0)
+                if (flush_dirty_buf(file) != 0)
                     goto write_out;
             }
 
-            if (count >= EXT4_RW_BUFFER_SIZE)
+            if (count >= DFS_EXT_CACHE_BUF_SIZE)
             {
                 /* Large write - bypass buffer entirely */
                 size_t wr = 0;
@@ -672,10 +682,10 @@ static ssize_t dfs_ext_write(struct dfs_file *file, const void *buf, size_t coun
             else
             {
                 /* Small write - start new buffer */
-                memcpy(ext_file->rw_buffer, src, count);
-                ext_file->rw_buf_pos = *pos;
-                ext_file->rw_buf_len = count;
-                ext_file->rw_buf_dirty = 1;
+                memcpy(ext_file->cache->buf, src, count);
+                ext_file->cache->bufFirstBytePos = *pos;
+                ext_file->cache->bufLen = count;
+                ext_file->cache->bufDirty = 1;
                 src += count;
                 *pos += (off_t)count;
                 byteswritten += count;
@@ -704,10 +714,10 @@ static int dfs_ext_flush(struct dfs_file *file)
         ext_file = (struct dfs_ext4_file *)file->data;
 
         /* Flush dirty buffer if any */
-        if (ext_file->rw_buffer && ext_file->rw_buf_dirty)
+        if (ext_file->cache && ext_file->cache->bufDirty)
         {
             rt_mutex_take(&file->vnode->lock, RT_WAITING_FOREVER);
-            error = flush_dirty_buffer(ext_file);
+            error = flush_dirty_buf(file);
             rt_mutex_release(&file->vnode->lock);
 
             if (error != 0)
@@ -757,12 +767,12 @@ static off_t dfs_ext_lseek(struct dfs_file *file, off_t offset, int whence)
             if (ret >= 0)
             {
                 /* Buffer: flush dirty data if seeking outside dirty range */
-                if (ext_file->rw_buffer && ext_file->rw_buf_dirty)
+                if (ext_file->cache && ext_file->cache->bufDirty)
                 {
-                    off_t buf_end = ext_file->rw_buf_pos + (off_t)ext_file->rw_buf_len;
-                    if (ret < ext_file->rw_buf_pos || ret > buf_end)
+                    off_t buf_end = ext_file->cache->bufFirstBytePos + (off_t)ext_file->cache->bufLen;
+                    if (ret < ext_file->cache->bufFirstBytePos || ret > buf_end)
                     {
-                        flush_dirty_buffer(ext_file);
+                        flush_dirty_buf(file);
                     }
                 }
                 ext_file->entry.file.fpos = ret;
@@ -790,9 +800,9 @@ static int dfs_ext_close(struct dfs_file *file)
         if (ext_file)
         {
             /* Flush dirty buffer before close */
-            if (ext_file->rw_buffer && ext_file->rw_buf_dirty)
+            if (ext_file->cache && ext_file->cache->bufDirty)
             {
-                flush_dirty_buffer(ext_file);
+                flush_dirty_buf(file);
             }
 
             if (ext_file->type == EXT4_DE_DIR)
@@ -805,10 +815,10 @@ static int dfs_ext_close(struct dfs_file *file)
             }
 
             /* Free buffer */
-            if (ext_file->rw_buffer)
+            if (ext_file->cache)
             {
-                rt_free(ext_file->rw_buffer);
-                ext_file->rw_buffer = NULL;
+                rt_free(ext_file->cache);
+                ext_file->cache = NULL;
             }
 
             if (ret == EOK)
@@ -846,20 +856,20 @@ static int dfs_ext_open(struct dfs_file *file)
                 ext_file = (struct dfs_ext4_file *)file->data;
                 ext_file->entry.dir.next_off = 0;
                 /* Directory copy: ensure buffer is NULL */
-                ext_file->rw_buffer = NULL;
+                ext_file->cache = NULL;
             }
             else
             {
                 file->data = ext_file;
                 /* Regular file re-open: ensure buffer exists */
-                if (!ext_file->rw_buffer)
+                if (!ext_file->cache)
                 {
-                    ext_file->rw_buffer = rt_malloc(EXT4_RW_BUFFER_SIZE);
-                    if (ext_file->rw_buffer)
+                    ext_file->cache = rt_malloc(sizeof(struct dfs_ext4_cache));
+                    if (ext_file->cache)
                     {
-                        ext_file->rw_buf_pos = 0;
-                        ext_file->rw_buf_len = 0;
-                        ext_file->rw_buf_dirty = 0;
+                        ext_file->cache->bufFirstBytePos = 0;
+                        ext_file->cache->bufLen = 0;
+                        ext_file->cache->bufDirty = 0;
                     }
                 }
             }
@@ -899,12 +909,12 @@ static int dfs_ext_open(struct dfs_file *file)
                         file->fpos = ext_file->entry.file.fpos;
 
                         /* Allocate read/write buffer */
-                        ext_file->rw_buffer = rt_malloc(EXT4_RW_BUFFER_SIZE);
-                        if (ext_file->rw_buffer)
+                        ext_file->cache = rt_malloc(sizeof(struct dfs_ext4_cache));
+                        if (ext_file->cache)
                         {
-                            ext_file->rw_buf_pos = 0;
-                            ext_file->rw_buf_len = 0;
-                            ext_file->rw_buf_dirty = 0;
+                            ext_file->cache->bufFirstBytePos = 0;
+                            ext_file->cache->bufLen = 0;
+                            ext_file->cache->bufDirty = 0;
                         }
                     }
                 }
@@ -1212,10 +1222,10 @@ static int dfs_ext_truncate(struct dfs_file *file, off_t offset)
         ext4_ftruncate(&(ext_file->entry.file), offset);
 
         /* Invalidate buffer after truncate */
-        if (ext_file->rw_buffer)
+        if (ext_file->cache)
         {
-            ext_file->rw_buf_len = 0;
-            ext_file->rw_buf_dirty = 0;
+            ext_file->cache->bufLen = 0;
+            ext_file->cache->bufDirty = 0;
         }
     }
 
@@ -1291,9 +1301,9 @@ static ssize_t dfs_ext_page_write(struct dfs_page *page)
         rt_mutex_take(&page->aspace->vnode->lock, RT_WAITING_FOREVER);
 
         /* Flush dirty buffer before direct write to ensure consistency */
-        if (ext_file->rw_buffer && ext_file->rw_buf_dirty)
+        if (ext_file->cache && ext_file->cache->bufDirty)
         {
-            flush_dirty_buffer(ext_file);
+            flush_dirty_cache(ext_file);
         }
 
         ext4_fseek(&(ext_file->entry.file), (int64_t)page->fpos, SEEK_SET);
